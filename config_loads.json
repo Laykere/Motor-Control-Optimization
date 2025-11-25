@@ -1,0 +1,25 @@
+{
+    "No Load (Free Spin)": {
+        "type": "none"
+    },
+    "Washing Machine (Agitation)": {
+        "type": "static",
+        "friction_threshold": 1.0
+    },
+    "Refrigerator Piston (Compressor)": {
+        "type": "compressor",
+        "pulse_base": 0.6,
+        "pulse_amp": 0.4
+    },
+    "Dishwasher Pump (Fluid Drag)": {
+        "type": "fan",
+        "drag_coeff": 0.0001
+    },
+    "Ice Crusher (Stochastic Impact)": {
+        "type": "crusher",
+        "drag_coeff": 0.00005,
+        "impact_chance": 0.15,
+        "impact_scale_min": 0.5,
+        "impact_scale_max": 1.5
+    }
+}

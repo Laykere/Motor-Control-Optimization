@@ -1,671 +1,476 @@
-# gui_app.py (Versão PySide6 + PyQtGraph)
-
+# gui_app.py
 import sys
 import time
 import numpy as np
-
-# 1. Importações do Qt (PySide6)
-
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QComboBox, QFrame, QScrollArea, QStackedWidget, QCheckBox,
-    QMessageBox
+    QMessageBox, QGroupBox, QFormLayout, QSlider, QProgressBar
 )
 from PyQt6.QtCore import QTimer, Qt
-
-# 2. Importação do PyQtGraph
 import pyqtgraph as pg
+from simulator import Simulator
 
-# 3. Importações da sua lógica de backend (NENHUMA MUDANÇA AQUI)
-from motor_simulator import MotorBLDC
-from controlador import ControladorPID, ComutadorTrapezoidal, Inversor, ControladorFOC
-
-# 4. Classe Simulador (IDÊNTICA À ANTERIOR, copiada para cá)
-# Nenhuma mudança necessária nesta classe.
-class Simulador:
-    """Orquestra o motor, controlador e armazena os dados históricos."""
+class GuiApplication(QWidget):
     
-    def __init__(self, dt):
-
-        self.dt = dt
-        self.tempo = 0.0
-        self.referencia_omega = 50.0
-        self.control_mode = '6-Step' 
-        
-        # 1. Instanciar Componentes
-        R, L, M, J, B, Ke, P = 1.0, 0.02, 0.006, 0.002, 0.0001, 0.2, 2
-        self.V_BUS_MAX = 80.0 
-        self.P = P
-        
-        self.motor = MotorBLDC(R, L, M, J, B, Ke, P)
-        self.motor.estado[3] = 0.001 
-        self.motor.set_bemf_shape('trapezoidal')
-        
-        self.voltage_ramp_rate = 200.0 
-        self.comando_v_anterior = 0.0  
-        
-        # Ganhos separados para cada modo
-        self.pid_ganhos_6step = {'Kp': 1.5, 'Ki': 0.1, 'Kd': 0.01}
-        self.pid_ganhos_foc = {'Kp': 6.0, 'Ki': 10.0, 'Kd': 0.01}
-        
-        # --- Componentes do Modo 6-Step ---
-        self.pid_vel_6step = ControladorPID(
-            self.pid_ganhos_6step['Kp'], self.pid_ganhos_6step['Ki'], self.pid_ganhos_6step['Kd'], 
-            0.0, self.V_BUS_MAX
-        )
-        self.comutador = ComutadorTrapezoidal(P)
-        self.inversor_6step = Inversor(self.V_BUS_MAX)
-
-        # --- Componentes do Modo FOC ---
-        Kp_d, Ki_d = 0.8, 0.2
-        Kp_q, Ki_q = 0.8, 0.2
-        
-        self.controlador_foc = ControladorFOC(
-            self.pid_ganhos_foc['Kp'], self.pid_ganhos_foc['Ki'], self.pid_ganhos_foc['Kd'], 
-            Kp_d, Ki_d, Kp_q, Ki_q, 
-            self.V_BUS_MAX, self.P
-        )
-
-        # 2. Histórico de Dados
-        # Limita o histórico para não consumir memória infinita
-        self.max_hist_points = 10000 
-        self.hist_tempo = []
-        self.hist_omega = []
-        self.hist_referencia = []
-        self.hist_Va = []
-        self.hist_Vb = []
-        self.hist_Vc = []
-        self.hist_Ia = []
-        self.hist_Ib = []
-        self.hist_Ic = []
-        
-    def rodar_passo(self):
-        """Executa um passo de simulação (lógica de modo dual)."""
-        
-        ia, ib, omega, theta = self.motor.estado
-        
-        if self.control_mode == '6-Step':
-            # 1. Lógica 6-Step (com Rampa e Anti-Windup Corrigido)
-            
-            # 1.A. Calcula a tensão que o PID 'deseja' (bruto) e o erro
-            comando_v_pid_bruto, erro_pid = self.pid_vel_6step.calcular_comando_bruto(self.referencia_omega, omega, self.dt)
-            
-            # 1.B. Calcula o comando que o PID *teria* enviado se estivesse sozinho
-            # (Limitado apenas pelo V_BUS)
-            comando_v_saturado_pid = np.clip(comando_v_pid_bruto, 
-                                             self.pid_vel_6step.V_MIN, 
-                                             self.pid_vel_6step.V_MAX)
-            
-            # 1.C. ATUALIZA O INTEGRADOR (Anti-Windup)
-            # O anti-windup só se importa com a saturação do V_BUS.
-            # Ele não deve saber sobre a rampa.
-            self.pid_vel_6step.atualizar_integrador(comando_v_pid_bruto, comando_v_saturado_pid, erro_pid, self.dt)
-            
-            # 1.D. Agora, aplica a RAMPA à saída JÁ SATURADA do PID
-            max_v_step = self.voltage_ramp_rate * self.dt 
-            comando_v_real = np.clip(comando_v_saturado_pid, 
-                                     self.comando_v_anterior - max_v_step, 
-                                     self.comando_v_anterior + max_v_step)
-            
-            # 1.E. Salva a saída da rampa para o próximo ciclo
-            self.comando_v_anterior = comando_v_real
-            
-            # 1.F. Envia o comando real (pós-rampa) para o inversor
-            comandos_fase = self.comutador.obter_comandos_de_fase(theta)
-            Va, Vb, Vc = self.inversor_6step.aplicar_tensao_nas_fases(comando_v_real, comandos_fase)
-        
-        else: # self.control_mode == 'FOC'
-            # 1. Lógica FOC (que agora lida com seu próprio anti-windup interno)
-            Va, Vb, Vc = self.controlador_foc.calcular_tensao(
-                self.referencia_omega, omega, ia, ib, theta, self.dt
-            )
-            # Reseta a rampa do 6-Step
-            self.comando_v_anterior = 0.0 
-
-        # 3. Avanço do Motor
-        self.motor.aplicar_tensoes(Va, Vb, Vc)
-        if not self.motor.avancar_tempo(self.dt):
-            return False 
-
-        # 4. Salvar Histórico
-        self.hist_tempo.append(self.tempo)
-        self.hist_omega.append(omega)
-        self.hist_referencia.append(self.referencia_omega)
-        self.hist_Va.append(Va)
-        self.hist_Vb.append(Vb)
-        self.hist_Vc.append(Vc)
-        
-        ic = -ia - ib 
-        self.hist_Ia.append(ia)
-        self.hist_Ib.append(ib)
-        self.hist_Ic.append(ic)
-        
-        self.tempo += self.dt
-        return True
-
-class AplicacaoGUI(QWidget):
-    """Cria a janela principal e o loop de visualização usando Qt."""
-    
-    def __init__(self, simulador):
+    def __init__(self, simulator_instance):
         super().__init__()
-        self.simulador = simulador
-        self.rodando = False
+        self.sim = simulator_instance
+        self.is_running = False
         
-        # Configurações de simulação
-        self.batch_size = 100 
+        # OPTIMIZATION: Reduced batch size for better responsiveness
+        self.batch_size = 20 
+        
         self.is_realtime_locked = False
         self.start_real_time = 0.0 
         self.start_sim_time = 0.0  
-        
-        # Configura o QTimer (o substituto do 'self.after' do Tkinter)
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.loop_simulacao)
-        
+        self.timer.setSingleShot(True) # Ensure timer only fires once per call
+        self.timer.timeout.connect(self.simulation_loop)
         self.init_ui()
         
     def init_ui(self):
-        """Configura todos os widgets e layouts."""
-        
-        # Layout principal (Horizontal: Controles | Gráficos)
         main_layout = QHBoxLayout(self)
-        
-        # --- Lado Esquerdo: Controles ---
-        self.criar_painel_controles()
-        
-        # --- Lado Direito: Gráficos ---
-        self.criar_painel_graficos()
-        
-        # Adiciona os painéis ao layout principal
-        main_layout.addWidget(self.scroll_area, 1) # Proporção 1
-        main_layout.addWidget(self.plot_widget_container, 3) # Proporção 3 (mais largo)
-        
-        # Configurações da Janela
-        self.setWindowTitle("Simulador BLDC (6-Step e FOC) - Versão Qt")
-        self.setGeometry(100, 100, 1200, 800) # (x, y, largura, altura)
+        self.create_control_panel()
+        self.create_plot_panel()
+        main_layout.addWidget(self.scroll_area, 1)
+        main_layout.addWidget(self.plot_container, 3)
+        self.setWindowTitle("White Goods BLDC Simulator - v2.6 (Stop Fix)")
+        self.setGeometry(100, 100, 1280, 800)
 
-    def criar_painel_controles(self):
-        """Cria a área de rolagem e todos os widgets de controle."""
-        
-        # QScrollArea substitui o Canvas+Scrollbar do Tkinter
+    def create_control_panel(self):
         self.scroll_area = QScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFixedWidth(260) 
+        self.scroll_area.setFixedWidth(320) 
         
-        # Widget e Layout internos para a área de rolagem
         scroll_content = QWidget()
-        frame_controle = QVBoxLayout(scroll_content) # QVBoxLayout é vertical
-        frame_controle.setAlignment(Qt.AlignmentFlag.AlignTop) # Alinha no topo
-        
+        self.layout_ctrl = QVBoxLayout(scroll_content)
+        self.layout_ctrl.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.scroll_area.setWidget(scroll_content)
 
-        # --- Botão Iniciar/Parar ---
-        self.btn_toggle = QPushButton("INICIAR SIMULAÇÃO", self)
-        self.btn_toggle.setStyleSheet("background-color: green; color: white; font-weight: bold;")
-        self.btn_toggle.clicked.connect(self.toggle_simulacao)
-        frame_controle.addWidget(self.btn_toggle)
+        # 1. MAIN CONTROL
+        self.btn_toggle = QPushButton("START SIMULATION", self)
+        self.btn_toggle.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 8px;")
+        self.btn_toggle.clicked.connect(self.toggle_simulation)
+        self.layout_ctrl.addWidget(self.btn_toggle)
         
-        # --- Checkbox Tempo Real ---
-        self.chk_realtime = QCheckBox("Limitar a 1x Tempo Real", self)
+        self.chk_realtime = QCheckBox("Lock to Real-Time", self)
         self.chk_realtime.toggled.connect(self.on_realtime_toggled)
-        frame_controle.addWidget(self.chk_realtime)
+        self.layout_ctrl.addWidget(self.chk_realtime)
         
-        self.status_label = QLabel("Status: N/A", self)
-        self.status_label.setStyleSheet("color: gray; font-style: italic;")
-        frame_controle.addWidget(self.status_label)
-        
-        # --- Referência ---
-        frame_controle.addWidget(self.criar_linha_separadora())
-        frame_controle.addWidget(QLabel("Ref. Velocidade (rad/s):"))
-        self.ref_entry = QLineEdit(str(self.simulador.referencia_omega), self)
-        self.btn_apply_ref = QPushButton("Aplicar Referência", self)
-        self.btn_apply_ref.clicked.connect(self.aplicar_referencia)
-        frame_controle.addWidget(self.ref_entry)
-        frame_controle.addWidget(self.btn_apply_ref)
+        self.lbl_status = QLabel("Status: Idle", self)
+        self.lbl_status.setStyleSheet("color: gray; font-style: italic; margin-bottom: 10px;")
+        self.layout_ctrl.addWidget(self.lbl_status)
 
-        # --- Modo de Controle ---
-        frame_controle.addWidget(self.criar_linha_separadora())
-        frame_controle.addWidget(QLabel("--- Modo de Controle ---"))
-        self.control_mode_combo = QComboBox(self)
-        self.control_mode_combo.addItems(['6-Step', 'FOC'])
-        frame_controle.addWidget(self.control_mode_combo)
+        # 2. MOTOR DB
+        group_motor = QGroupBox("Appliance Motor (config_motors.json)")
+        l_motor = QVBoxLayout()
+        self.combo_motor = QComboBox()
+        self.combo_motor.addItems(list(self.sim.motor_db.keys()))
+        self.combo_motor.currentTextChanged.connect(self.on_motor_changed)
+        l_motor.addWidget(self.combo_motor)
+        group_motor.setLayout(l_motor)
+        self.layout_ctrl.addWidget(group_motor)
 
-        # --- Ganhos PID (com QStackedWidget) ---
-        frame_controle.addWidget(QLabel("--- Ganhos PID (Velocidade) ---"))
-        
-        # QStackedWidget é a forma correta no Qt de alternar painéis
-        self.pid_stack = QStackedWidget(self)
-        
-        # Ganhos 6-Step (Página 0)
-        self.frame_ganhos_6step = QWidget()
-        layout_6step = QVBoxLayout(self.frame_ganhos_6step)
-        self.kp_entry_6step = QLineEdit(str(self.simulador.pid_ganhos_6step['Kp']), self)
-        self.ki_entry_6step = QLineEdit(str(self.simulador.pid_ganhos_6step['Ki']), self)
-        self.kd_entry_6step = QLineEdit(str(self.simulador.pid_ganhos_6step['Kd']), self)
-        layout_6step.addWidget(QLabel("Kp (6-Step):"))
-        layout_6step.addWidget(self.kp_entry_6step)
-        layout_6step.addWidget(QLabel("Ki (6-Step):"))
-        layout_6step.addWidget(self.ki_entry_6step)
-        layout_6step.addWidget(QLabel("Kd (6-Step):"))
-        layout_6step.addWidget(self.kd_entry_6step)
-        
-        # Ganhos FOC (Página 1)
-        self.frame_ganhos_foc = QWidget()
-        layout_foc = QVBoxLayout(self.frame_ganhos_foc)
-        self.kp_entry_foc = QLineEdit(str(self.simulador.pid_ganhos_foc['Kp']), self)
-        self.ki_entry_foc = QLineEdit(str(self.simulador.pid_ganhos_foc['Ki']), self)
-        self.kd_entry_foc = QLineEdit(str(self.simulador.pid_ganhos_foc['Kd']), self)
-        layout_foc.addWidget(QLabel("Kp (FOC):"))
-        layout_foc.addWidget(self.kp_entry_foc)
-        layout_foc.addWidget(QLabel("Ki (FOC):"))
-        layout_foc.addWidget(self.ki_entry_foc)
-        layout_foc.addWidget(QLabel("Kd (FOC):"))
-        layout_foc.addWidget(self.kd_entry_foc)
-        
-        self.pid_stack.addWidget(self.frame_ganhos_6step) # Índice 0
-        self.pid_stack.addWidget(self.frame_ganhos_foc)  # Índice 1
-        frame_controle.addWidget(self.pid_stack)
-        
-        # Conecta o ComboBox ao StackedWidget
-        self.control_mode_combo.currentIndexChanged.connect(self.pid_stack.setCurrentIndex)
-        
-        # --- Controles de Simulação ---
-        frame_controle.addWidget(self.criar_linha_separadora())
-        frame_controle.addWidget(QLabel("--- Controles de Simulação ---"))
-        self.dt_entry = QLineEdit(str(self.simulador.dt), self)
-        self.batch_entry = QLineEdit(str(self.batch_size), self)
-        self.ramp_entry = QLineEdit(str(self.simulador.voltage_ramp_rate), self)
-        frame_controle.addWidget(QLabel("DT (s):"))
-        frame_controle.addWidget(self.dt_entry)
-        frame_controle.addWidget(QLabel("Passos/Frame:"))
-        frame_controle.addWidget(self.batch_entry)
-        frame_controle.addWidget(QLabel("Rampa de Tensão (V/s):"))
-        frame_controle.addWidget(self.ramp_entry)
+        # 3. REFERENCE
+        group_ref = QGroupBox("Reference Speed")
+        l_ref = QVBoxLayout()
+        self.entry_ref = QLineEdit(str(self.sim.target_speed))
+        self.btn_ref = QPushButton("Set Speed (rad/s)", self)
+        self.btn_ref.clicked.connect(self.apply_reference)
+        l_ref.addWidget(self.entry_ref)
+        l_ref.addWidget(self.btn_ref)
+        group_ref.setLayout(l_ref)
+        self.layout_ctrl.addWidget(group_ref)
 
-        # --- Janela de Gráfico Rolante ---
-        self.chk_rolling_window = QCheckBox("Janela de Gráfico Rolante", self)
-        self.chk_rolling_window.setChecked(False) # Começa desligado
-        frame_controle.addWidget(self.chk_rolling_window)
+        # 4. LOAD PROFILE
+        group_load = QGroupBox("Load Profile (config_loads.json)")
+        l_load = QVBoxLayout()
         
-        frame_controle.addWidget(QLabel("Tamanho da Janela (s):"))
-        self.window_entry = QLineEdit("5.0", self) # Valor padrão de 5.0s
-        frame_controle.addWidget(self.window_entry)        
-
-        # --- Simulação em Batch ---
-        frame_controle.addWidget(self.criar_linha_separadora())
-        frame_controle.addWidget(QLabel("--- Simulação em Batch ---"))
-        self.duration_entry = QLineEdit("1.0", self)
-        self.btn_batch_run = QPushButton("Rodar Simulação (Batch)", self)
-        self.btn_batch_run.setStyleSheet("background-color: orange;")
-        self.btn_batch_run.clicked.connect(self.run_batch_simulation)
-        frame_controle.addWidget(QLabel("Duração Sim. (s):"))
-        frame_controle.addWidget(self.duration_entry)
-        frame_controle.addWidget(self.btn_batch_run)
-
-        # --- Botão Aplicar/Reiniciar ---
-        self.btn_apply = QPushButton("Aplicar Ganhos e Reiniciar", self)
-        self.btn_apply.setStyleSheet("background-color: lightblue;")
-        self.btn_apply.clicked.connect(self.aplicar_ganhos_e_reiniciar)
-        frame_controle.addWidget(self.btn_apply)
-
-    def criar_painel_graficos(self):
-        """Cria os 3 gráficos usando PyQtGraph."""
+        l_load.addWidget(QLabel("Load Characteristic:"))
+        self.combo_load = QComboBox()
+        self.combo_load.addItems(list(self.sim.load_db.keys()))
+        self.combo_load.currentTextChanged.connect(self.on_load_profile_changed)
+        l_load.addWidget(self.combo_load)
         
-        # Define o fundo padrão do PyQtGraph
+        self.lbl_load_val = QLabel("Scale / Torque: 0.00")
+        l_load.addWidget(self.lbl_load_val)
+        
+        self.slider_load = QSlider(Qt.Orientation.Horizontal)
+        self.slider_load.setMinimum(0)
+        self.slider_load.setMaximum(1000) 
+        self.slider_load.setValue(0)
+        self.slider_load.valueChanged.connect(self.on_load_value_changed)
+        l_load.addWidget(self.slider_load)
+        
+        group_load.setLayout(l_load)
+        self.layout_ctrl.addWidget(group_load)
+
+        # 5. TUNING
+        group_pid = QGroupBox("Inverter Tuning")
+        l_pid = QVBoxLayout()
+        l_pid.addWidget(QLabel("Algorithm:"))
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(['6-Step (Trapezoidal)', 'FOC (Sinusoidal)'])
+        l_pid.addWidget(self.combo_mode)
+        
+        self.stack_pid = QStackedWidget()
+        
+        self.page_6step = QWidget()
+        form_6step = QFormLayout(self.page_6step)
+        self.in_kp_6step = QLineEdit(str(self.sim.pid_gains_6step['Kp']))
+        self.in_ki_6step = QLineEdit(str(self.sim.pid_gains_6step['Ki']))
+        self.in_kd_6step = QLineEdit(str(self.sim.pid_gains_6step['Kd']))
+        form_6step.addRow("Kp:", self.in_kp_6step)
+        form_6step.addRow("Ki:", self.in_ki_6step)
+        form_6step.addRow("Kd:", self.in_kd_6step)
+        
+        self.page_foc = QWidget()
+        form_foc = QFormLayout(self.page_foc)
+        self.in_kp_foc = QLineEdit(str(self.sim.pid_gains_foc['Kp']))
+        self.in_ki_foc = QLineEdit(str(self.sim.pid_gains_foc['Ki']))
+        self.in_kd_foc = QLineEdit(str(self.sim.pid_gains_foc['Kd']))
+        form_foc.addRow("Kp:", self.in_kp_foc)
+        form_foc.addRow("Ki:", self.in_ki_foc)
+        form_foc.addRow("Kd:", self.in_kd_foc)
+        
+        self.stack_pid.addWidget(self.page_6step)
+        self.stack_pid.addWidget(self.page_foc)
+        l_pid.addWidget(self.stack_pid)
+        self.combo_mode.currentIndexChanged.connect(self.stack_pid.setCurrentIndex)
+        group_pid.setLayout(l_pid)
+        self.layout_ctrl.addWidget(group_pid)
+
+        # 6. SIM OPTIONS
+        group_sim = QGroupBox("Simulation Physics")
+        form_sim = QFormLayout()
+        self.in_dt = QLineEdit(str(self.sim.dt))
+        self.in_batch = QLineEdit(str(self.batch_size))
+        self.in_ramp = QLineEdit(str(self.sim.voltage_ramp_rate))
+        form_sim.addRow("DT (s):", self.in_dt)
+        form_sim.addRow("Steps/Frame:", self.in_batch)
+        form_sim.addRow("V Ramp (V/s):", self.in_ramp)
+        group_sim.setLayout(form_sim)
+        self.layout_ctrl.addWidget(group_sim)
+
+        # 7. TOOLS
+        group_vis = QGroupBox("Tools")
+        l_vis = QVBoxLayout()
+        
+        self.chk_rolling = QCheckBox("Rolling Chart", self)
+        l_vis.addWidget(self.chk_rolling)
+        
+        form_tools = QFormLayout()
+        self.in_window = QLineEdit("5.0")
+        form_tools.addRow("Window (s):", self.in_window)
+        self.in_duration = QLineEdit("1.0")
+        form_tools.addRow("Batch Time (s):", self.in_duration)
+        l_vis.addLayout(form_tools)
+        
+        # Loading Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #007bff; }")
+        l_vis.addWidget(self.progress_bar)
+        
+        self.btn_batch = QPushButton("Run Batch", self)
+        self.btn_batch.setStyleSheet("background-color: #ffc107; color: black; font-weight: bold;")
+        self.btn_batch.clicked.connect(self.run_batch)
+        l_vis.addWidget(self.btn_batch)
+        
+        group_vis.setLayout(l_vis)
+        self.layout_ctrl.addWidget(group_vis)
+
+        # APPLY
+        self.btn_apply = QPushButton("APPLY SETTINGS & RESET", self)
+        self.btn_apply.setStyleSheet("background-color: #17a2b8; color: white; font-weight: bold; padding: 8px; margin-top: 5px;")
+        self.btn_apply.clicked.connect(self.apply_settings_restart)
+        self.layout_ctrl.addWidget(self.btn_apply)
+
+    def create_plot_panel(self):
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
-
-        self.plot_widget_container = QWidget()
-        plot_layout = QVBoxLayout(self.plot_widget_container)
+        self.plot_container = QWidget()
+        layout = QVBoxLayout(self.plot_container)
         
-        # Gráfico de Velocidade
-        self.plot_velocidade = pg.PlotWidget(title="Velocidade")
-        self.plot_velocidade.addLegend()
-        self.plot_velocidade.setLabel('left', 'Velocidade (rad/s)')
-        self.plot_velocidade.showGrid(x=True, y=True)
-        self.linha_omega = self.plot_velocidade.plot(pen=pg.mkPen('b', width=2), name='ω Real (rad/s)')
-        self.linha_ref = self.plot_velocidade.plot(pen=pg.mkPen('r', style=Qt.PenStyle.DashLine, width=2), name='ω Ref (rad/s)')
-        plot_layout.addWidget(self.plot_velocidade)
+        self.plot_speed = pg.PlotWidget(title="Rotor Speed (ω)")
+        self.plot_speed.addLegend()
+        self.plot_speed.showGrid(x=True, y=True)
+        self.curve_speed = self.plot_speed.plot(pen=pg.mkPen('#007bff', width=2), name='Real')
+        self.curve_ref = self.plot_speed.plot(pen=pg.mkPen('r', style=Qt.PenStyle.DashLine, width=2), name='Ref')
+        layout.addWidget(self.plot_speed)
 
-        # Gráfico de Tensão
-        self.plot_tensao = pg.PlotWidget(title="Tensão de Fase")
-        self.plot_tensao.addLegend()
-        self.plot_tensao.setLabel('left', 'Tensão (V)')
-        self.plot_tensao.showGrid(x=True, y=True)
-        self.linha_Va = self.plot_tensao.plot(pen=pg.mkPen('b', width=1), name='Va (V)')
-        self.linha_Vb = self.plot_tensao.plot(pen=pg.mkPen('g', width=1), name='Vb (V)')
-        self.linha_Vc = self.plot_tensao.plot(pen=pg.mkPen('r', width=1), name='Vc (V)')
-        v_lim = self.simulador.V_BUS_MAX / 2 * 1.1
-        self.plot_tensao.setYRange(-v_lim, v_lim)
-        plot_layout.addWidget(self.plot_tensao)
+        self.plot_voltage = pg.PlotWidget(title="Phase Voltages (UVW)")
+        self.plot_voltage.showGrid(x=True, y=True)
+        self.curve_Va = self.plot_voltage.plot(pen=pg.mkPen('r', width=1))
+        self.curve_Vb = self.plot_voltage.plot(pen=pg.mkPen('g', width=1))
+        self.curve_Vc = self.plot_voltage.plot(pen=pg.mkPen('b', width=1))
+        layout.addWidget(self.plot_voltage)
         
-        # Gráfico de Corrente
-        self.plot_corrente = pg.PlotWidget(title="Corrente de Fase")
-        self.plot_corrente.addLegend()
-        self.plot_corrente.setLabel('left', 'Corrente (A)')
-        self.plot_corrente.setLabel('bottom', 'Tempo (s)')
-        self.plot_corrente.showGrid(x=True, y=True)
-        self.linha_Ia = self.plot_corrente.plot(pen=pg.mkPen('b', width=1), name='Ia (A)')
-        self.linha_Ib = self.plot_corrente.plot(pen=pg.mkPen('g', width=1), name='Ib (A)')
-        self.linha_Ic = self.plot_corrente.plot(pen=pg.mkPen('r', width=1), name='Ic (A)')
-        self.plot_corrente.setYRange(-25, 25) # Limite fixo de corrente
-        plot_layout.addWidget(self.plot_corrente)
+        self.plot_current = pg.PlotWidget(title="Phase Currents (Iabc)")
+        self.plot_current.showGrid(x=True, y=True)
+        self.curve_Ia = self.plot_current.plot(pen=pg.mkPen('r', width=1))
+        self.curve_Ib = self.plot_current.plot(pen=pg.mkPen('g', width=1))
+        self.curve_Ic = self.plot_current.plot(pen=pg.mkPen('b', width=1))
+        self.plot_current.setYRange(-10, 10)
+        layout.addWidget(self.plot_current)
+        
+        self.plot_voltage.setXLink(self.plot_speed)
+        self.plot_current.setXLink(self.plot_speed)
 
-        # Linka os eixos X
-        self.plot_tensao.setXLink(self.plot_velocidade)
-        self.plot_corrente.setXLink(self.plot_velocidade)
-        
-    def criar_linha_separadora(self):
-        """Helper para criar uma linha HFrame."""
-        line = QFrame(self)
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        return line
-   
-    def aplicar_referencia(self):
+    # --- HANDLERS ---
+    def on_motor_changed(self, motor_name):
+        self.sim.load_motor_from_db(motor_name)
+        self.lbl_status.setText(f"Loaded: {motor_name}")
+        self.update_plots(force_clear=True)
+
+    def on_load_profile_changed(self, profile_name):
+        self.sim.set_load_profile(profile_name)
+        load_type = self.sim.active_load_profile.get("type", "none")
+        if load_type == 'none':
+            self.slider_load.setEnabled(False)
+            self.lbl_load_val.setText("Scale / Torque: 0.00 (Free Spin)")
+        else:
+            self.slider_load.setEnabled(True)
+            val = self.slider_load.value() / 100.0
+            self.lbl_load_val.setText(f"Scale / Torque: {val:.2f}")
+
+    def on_load_value_changed(self, val):
+        torque = val / 100.0 
+        self.sim.load_torque_mag = torque
+        self.lbl_load_val.setText(f"Scale / Torque: {torque:.2f}")
+
+    def apply_reference(self):
         try:
-            nova_ref = float(self.ref_entry.text())
-            self.simulador.referencia_omega = nova_ref
-            print(f"Referência de velocidade atualizada para {nova_ref} rad/s")
-        except ValueError:
-            QMessageBox.warning(self, "Erro", "Referência inválida. Insira um número.")
-            
+            val = float(self.entry_ref.text())
+            self.sim.target_speed = val
+        except ValueError: pass
+
     def on_realtime_toggled(self, checked):
         self.is_realtime_locked = checked
 
-    def aplicar_ganhos_e_reiniciar(self):
-        """Lê os widgets, atualiza os ganhos, MODO, e reinicia a simulação."""
+    def apply_settings_restart(self):
         try:
-            # 1. Lê os ganhos de AMBOS os painéis
-            new_kp_6step = float(self.kp_entry_6step.text())
-            new_ki_6step = float(self.ki_entry_6step.text())
-            new_kd_6step = float(self.kd_entry_6step.text())
+            kp_6 = float(self.in_kp_6step.text())
+            ki_6 = float(self.in_ki_6step.text())
+            kd_6 = float(self.in_kd_6step.text())
+            kp_f = float(self.in_kp_foc.text())
+            ki_f = float(self.in_ki_foc.text())
+            kd_f = float(self.in_kd_foc.text())
             
-            new_kp_foc = float(self.kp_entry_foc.text())
-            new_ki_foc = float(self.ki_entry_foc.text())
-            new_kd_foc = float(self.kd_entry_foc.text())
+            dt = float(self.in_dt.text())
+            batch = int(self.in_batch.text())
             
-            # 2. Lê os valores de simulação
-            new_dt = float(self.dt_entry.text())
-            new_batch_size = int(self.batch_entry.text())
-            new_ramp_rate = float(self.ramp_entry.text())
+            # Limit batch size to prevent freezing
+            #CHECK THE INTERFERENCE WITH BATCH PROCESSING AND WINDOW RESIZING (MIGHT BE CAUSING ISSUES) ########################################################################################################################################################################################################################################################################
+            # if batch > 200: 
+            #     batch = 200
+            #     self.in_batch.setText("200")
             
-            # 3. Atualiza os valores
-            self.simulador.dt = new_dt
-            self.batch_size = new_batch_size
-            self.simulador.voltage_ramp_rate = new_ramp_rate
+            ramp = float(self.in_ramp.text())
             
-            # 4. Lê o modo de controle
-            new_mode = self.control_mode_combo.currentText()
-
-            # 5. Atualiza os ganhos nos controladores
-            self.simulador.pid_vel_6step.Kp = new_kp_6step
-            self.simulador.pid_vel_6step.Ki = new_ki_6step
-            self.simulador.pid_vel_6step.Kd = new_kd_6step
+            self.sim.dt = dt
+            self.batch_size = batch
+            self.sim.voltage_ramp_rate = ramp
             
-            self.simulador.controlador_foc.atualizar_ganhos_velocidade(
-                new_kp_foc, new_ki_foc, new_kd_foc
-            )
+            self.sim.pid_vel_6step.Kp = kp_6
+            self.sim.pid_vel_6step.Ki = ki_6
+            self.sim.pid_vel_6step.Kd = kd_6
             
-            # 6. Zera o estado
-            self.simulador.pid_vel_6step.reset()
-            self.simulador.controlador_foc.reset()
-            self.simulador.comando_v_anterior = 0.0 
+            self.sim.controller_foc.atualizar_ganhos_velocidade(kp_f, ki_f, kd_f)
             
-            self.simulador.control_mode = new_mode
-            if new_mode == 'FOC':
-                self.simulador.motor.set_bemf_shape('sinusoidal')
-            else: # '6-Step'
-                self.simulador.motor.set_bemf_shape('trapezoidal')
-                
-            self.simulador.motor.estado = np.zeros(4)
-            self.simulador.motor.estado[3] = 0.001 
-            self.simulador.tempo = 0.0
+            self.sim.pid_vel_6step.reset()
+            self.sim.controller_foc.reset()
+            self.sim.prev_voltage_cmd = 0.0
             
-            # 7. Limpa o histórico para o gráfico
-            self.simulador.hist_tempo = []
-            self.simulador.hist_omega = []
-            self.simulador.hist_referencia = []
-            self.simulador.hist_Va = []
-            self.simulador.hist_Vb = []
-            self.simulador.hist_Vc = []
-            self.simulador.hist_Ia = []
-            self.simulador.hist_Ib = []
-            self.simulador.hist_Ic = []
-            
-            print(f"Modo: {new_mode}. Ganhos 6-Step: {new_kp_6step}/{new_ki_6step}/{new_kd_6step}. Ganhos FOC: {new_kp_foc}/{new_ki_foc}/{new_kd_foc}")
-            print(f"Simulador atualizado: DT={new_dt}s, Passos/Frame={new_batch_size}, Rampa={new_ramp_rate} V/s")
-            
-            # --- SUBSTITUA A LINHA 'self.atualizar_grafico()' POR ESTA: ---
-            # Esta chamada força a limpeza visual dos gráficos
-            self.update_plots(force_clear=True)
-            # --- FIM DA ALTERAÇÃO ---
-            
-        except ValueError:
-            QMessageBox.warning(self, "Erro", "Valores inválidos. Insira números válidos para Ganhos, DT e Passos.")
-
-    def toggle_simulacao(self):
-        self.rodando = not self.rodando
-        if self.rodando:
-            self.btn_toggle.setText("PARAR SIMULAÇÃO")
-            self.btn_toggle.setStyleSheet("background-color: red; color: white; font-weight: bold;")
-            self.btn_batch_run.setEnabled(False) # Desabilita o botão de batch
-
-            self.start_real_time = time.time()
-            self.start_sim_time = self.simulador.tempo
-            
-            # Inicia o QTimer. O delay é gerenciado dentro do loop.
-            self.timer.start(1) 
-        else:
-            self.timer.stop()
-            self.btn_toggle.setText("INICIAR SIMULAÇÃO")
-            self.btn_toggle.setStyleSheet("background-color: green; color: white; font-weight: bold;")
-            self.btn_batch_run.setEnabled(True) # Reabilita o botão de batch
-            self.status_label.setText("Parado.")
-            self.status_label.setStyleSheet("color: gray;")
-            self.update_plots()
-
-    def loop_simulacao(self):
-        """Este método é chamado pelo QTimer."""
-        if not self.rodando:
-            return
-
-        # 1. Roda o "batch" de simulação
-        try:
-            for _ in range(self.batch_size):
-                if not self.simulador.rodar_passo():
-                    self.toggle_simulacao() # Para em caso de erro
-                    return
-        except Exception as e:
-            QMessageBox.critical(self, "Erro de Simulação", f"Erro na física: {e}")
-            self.toggle_simulacao()
-            return
-        
-        # 2. Atualiza o gráfico (visual)
-        self.update_plots()
-
-        # 3. Lógica de "Delay" e "Status"
-        delay_ms = 1 # Padrão: 1ms (Roda o mais rápido possível)
-        status_text = "Rápido (Tempo Real Desligado)"
-        status_color = "gray"
-
-        if self.is_realtime_locked:
-            sim_time_elapsed = self.simulador.tempo - self.start_sim_time
-            real_time_elapsed = time.time() - self.start_real_time
-            time_diff_s = sim_time_elapsed - real_time_elapsed
-            
-            if time_diff_s > 0.01:
-                delay_ms = int(time_diff_s * 1000)
-                status_text = f"Sincronizado (Aguardando {delay_ms}ms)"
-                status_color = "green"
-            elif time_diff_s < -0.1:
-                delay_ms = 1 
-                status_text = f"Atrasado (Carga Alta: {time_diff_s:.2f}s)"
-                status_color = "red"
+            mode_txt = self.combo_mode.currentText()
+            if '6-Step' in mode_txt:
+                self.sim.control_mode = '6-Step'
+                self.sim.motor.set_bemf_shape('trapezoidal')
             else:
-                delay_ms = 1 
-                status_text = "Sincronizado"
-                status_color = "green"
-        
-        self.status_label.setText(status_text)
-        self.status_label.setStyleSheet(f"color: {status_color}; font-style: italic;")
-        
-        # Agenda o próximo loop
-        self.timer.start(max(1, delay_ms))
-
-    def run_batch_simulation(self):
-        """Roda a simulação inteira de uma vez (modo 'batch')."""
-        
-        if self.rodando:
-            QMessageBox.warning(self, "Erro", "Pare a simulação interativa antes de rodar em batch.")
-            return
-
-        try:
-            duracao = float(self.duration_entry.text())
-            if duracao <= 0: raise ValueError("Duração deve ser positiva")
+                self.sim.control_mode = 'FOC'
+                self.sim.motor.set_bemf_shape('sinusoidal')
+                
+            self.sim.motor.estado = np.zeros(4)
+            self.sim.motor.estado[3] = 0.001
+            self.sim.time = 0.0
+            self.sim.reset_history()
+            self.update_plots(force_clear=True)
+            
         except ValueError:
-            QMessageBox.warning(self, "Erro", "Duração inválida. Insira um número positivo.")
+            QMessageBox.warning(self, "Error", "Invalid numerical input.")
+
+    def toggle_simulation(self):
+        self.is_running = not self.is_running
+        
+        if self.is_running:
+            self.btn_toggle.setText("STOP")
+            self.btn_toggle.setStyleSheet("background-color: #dc3545; color: white;")
+            self.start_real_time = time.time()
+            self.start_sim_time = self.sim.time
+            self.timer.start(1)
+        else:
+            # STOP LOGIC
+            self.timer.stop() # Kill timer
+            self.btn_toggle.setText("START SIMULATION")
+            self.btn_toggle.setStyleSheet("background-color: #28a745; color: white;")
+            self.lbl_status.setText("Stopped")
+
+    def simulation_loop(self):
+        # 1. Immediate exit check
+        if not self.is_running: 
             return
 
         try:
-            # 2. Limpa e prepara a simulação
-            self.aplicar_ganhos_e_reiniciar()
-            
-            # 3. Atualiza a GUI para mostrar "Rodando..."
-            self.status_label.setText(f"Rodando batch até {duracao}s...")
-            self.status_label.setStyleSheet("color: blue; font-style: italic;")
-            QApplication.processEvents() # Força a atualização da GUI
-
-            # 4. Roda a simulação (Isso irá congelar a GUI)
-            print("Iniciando simulação em batch...")
-            start_batch_time = time.time()
-            
-            while self.simulador.tempo < duracao:
-                if not self.simulador.rodar_passo():
-                    raise Exception("Erro no solver do motor.")
-            
-            end_batch_time = time.time()
-            print(f"Batch concluído em {end_batch_time - start_batch_time:.4f}s reais.")
-
-            # 5. Atualiza o gráfico com os resultados finais
-            self.update_plots()
-            self.status_label.setText("Batch concluído.")
-            self.status_label.setStyleSheet("color: green; font-style: italic;")
+            for i in range(self.batch_size):
+                if not self.sim.run_step():
+                    self.toggle_simulation()
+                    return
+                
+                # 2. Check for stop signal INSIDE the loop
+                # This makes the Stop button responsive during calculation
+                if i % 5 == 0:
+                    QApplication.processEvents()
+                    if not self.is_running:
+                        return
 
         except Exception as e:
-            error_msg = f"Erro no batch: {e}"
-            print(error_msg)
-            QMessageBox.critical(self, "Erro de Simulação", error_msg)
-            self.status_label.setText("Erro no batch.")
-            self.status_label.setStyleSheet("color: red; font-style: italic;")
+            print(f"Sim Error: {e}")
+            self.toggle_simulation()
+            return
+            
+        self.update_plots()
+        
+        # 3. Delay Logic
+        delay_ms = 1
+        status = "Fast (Uncapped)"
+        if self.is_realtime_locked:
+            sim_elapsed = self.sim.time - self.start_sim_time
+            real_elapsed = time.time() - self.start_real_time
+            diff = sim_elapsed - real_elapsed
+            if diff > 0.01:
+                delay_ms = int(diff * 1000)
+                status = "Synced"
+            elif diff < -0.1:
+                status = "Lagging"
+        
+        self.lbl_status.setText(f"Status: {status}")
+        
+        # 4. CONDITIONAL RESTART
+        # Only restart the timer if the user hasn't clicked STOP during this loop
+        if self.is_running:
+            self.timer.start(max(1, delay_ms))
 
-# gui_app.py
+    def run_batch(self):
+        if self.is_running: return
+        
+        try:
+            duration_s = float(self.in_duration.text())
+            if duration_s <= 0: raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Invalid Batch Duration")
+            return
+
+        # --- FIX: DYNAMIC MEMORY RESIZING ---
+        # Calculate how many points are needed for this specific duration
+        # Add 2000 points margin to be safe
+        needed_points = int(duration_s / self.sim.dt) + 2000
+        
+        # Override the simulator's limit BEFORE resetting
+        self.sim.max_hist_points = needed_points
+        print(f"Batch Memory Resized to: {needed_points} points")
+
+        self.apply_settings_restart()
+        
+        # --- UI SETUP ---
+        self.progress_bar.setValue(0)
+        self.btn_batch.setEnabled(False)
+        self.btn_batch.setText("Calculating...")
+        QApplication.processEvents()
+        
+        total_steps = int(duration_s / self.sim.dt)
+        steps_per_update = max(1, total_steps // 100)
+        current_step = 0
+        
+        try:
+            while self.sim.time < duration_s:
+                if not self.sim.run_step(): break
+                
+                current_step += 1
+                if current_step % steps_per_update == 0:
+                    percent = int((current_step / total_steps) * 100)
+                    self.progress_bar.setValue(percent)
+                    QApplication.processEvents()
+        except Exception as e:
+            print(f"Batch Error: {e}")
+        
+        self.progress_bar.setValue(100)
+        self.update_plots()
+        self.btn_batch.setEnabled(True)
+        self.btn_batch.setText("Run Batch")
 
     def update_plots(self, force_clear=False):
-        """Atualiza os gráficos do PyQtGraph com os novos dados."""
-        
-        # Se forçado a limpar (ex: ao reiniciar), apaga todos os dados do gráfico
         if force_clear:
-            self.linha_omega.setData(x=[], y=[])
-            self.linha_ref.setData(x=[], y=[])
-            self.linha_Va.setData(x=[], y=[])
-            self.linha_Vb.setData(x=[], y=[])
-            self.linha_Vc.setData(x=[], y=[])
-            self.linha_Ia.setData(x=[], y=[])
-            self.linha_Ib.setData(x=[], y=[])
-            self.linha_Ic.setData(x=[], y=[])
-            self.plot_velocidade.setXRange(0, 0.1, padding=0)
+            self.curve_speed.setData([], []); self.curve_ref.setData([], [])
+            self.curve_Va.setData([], []); self.curve_Vb.setData([], []); self.curve_Vc.setData([], [])
+            self.curve_Ia.setData([], []); self.curve_Ib.setData([], []); self.curve_Ic.setData([], [])
             return
 
-        tempo = self.simulador.hist_tempo
-        if not tempo: # Não faz nada se o histórico estiver vazio
-            return
-            
-        # --- Lógica de Fatiamento de Dados (Slicing) ---
+        if len(self.sim.hist_time) == 0: return
+
+        # 1. Converte tempo para array numpy (Otimização)
+        t = np.array(self.sim.hist_time)
         
-        # Por padrão, usa todos os dados
-        tempo_plot = tempo
-        omega_plot = self.simulador.hist_omega
-        ref_plot = self.simulador.hist_referencia
-        va_plot = self.simulador.hist_Va
-        vb_plot = self.simulador.hist_Vb
-        vc_plot = self.simulador.hist_Vc
-        ia_plot = self.simulador.hist_Ia
-        ib_plot = self.simulador.hist_Ib
-        ic_plot = self.simulador.hist_Ic
-        
-        current_time = tempo[-1]
+        # 2. Define janela de visualização (Padrão: tudo)
         t_start = 0.0
-
-        # Verifica se "Janela Rolante" está LIGADA e se a simulação está RODANDO
-        if self.chk_rolling_window.isChecked() and self.rodando:
+        idx = 0
+        
+        # Só calcula janela se a opção estiver marcada E a simulação estiver rodando interativamente
+        if self.chk_rolling.isChecked() and self.is_running:
             try:
-                window_size = float(self.window_entry.text())
-                if window_size <= 0: window_size = 5.0
+                win_size = float(self.in_window.text())
             except ValueError:
-                window_size = 5.0
-            
-            t_start = max(0.0, current_time - window_size)
-            
-            # Encontra o índice inicial para fatiar os dados
-            # (np.searchsorted é muito rápido para encontrar o índice em uma lista ordenada)
-            start_index = np.searchsorted(np.array(tempo), t_start)
-            
-            # Fatia (Slice) todos os dados para plotar apenas a janela
-            tempo_plot = tempo[start_index:]
-            omega_plot = self.simulador.hist_omega[start_index:]
-            ref_plot = self.simulador.hist_referencia[start_index:]
-            va_plot = self.simulador.hist_Va[start_index:]
-            vb_plot = self.simulador.hist_Vb[start_index:]
-            vc_plot = self.simulador.hist_Vc[start_index:]
-            ia_plot = self.simulador.hist_Ia[start_index:]
-            ib_plot = self.simulador.hist_Ib[start_index:]
-            ic_plot = self.simulador.hist_Ic[start_index:]
-        else:
-            # Se pausado ou se a janela rolante estiver desligada,
-            # garante que o X Range mostre tudo de 0 até o fim
-            t_start = 0.0
-            
-        # --- Atualiza os dados das linhas (com os dados fatiados ou completos) ---
-        self.linha_omega.setData(x=tempo_plot, y=omega_plot)
-        self.linha_ref.setData(x=tempo_plot, y=ref_plot)
-        
-        self.linha_Va.setData(x=tempo_plot, y=va_plot)
-        self.linha_Vb.setData(x=tempo_plot, y=vb_plot)
-        self.linha_Vc.setData(x=tempo_plot, y=vc_plot)
-        
-        self.linha_Ia.setData(x=tempo_plot, y=ia_plot)
-        self.linha_Ib.setData(x=tempo_plot, y=ib_plot)
-        self.linha_Ic.setData(x=tempo_plot, y=ic_plot)
-        
-        # --- Atualiza os limites (Range) ---
-        self.plot_velocidade.setXRange(t_start, current_time, padding=0.01)
+                win_size = 5.0
+            t_start = max(0.0, t[-1] - win_size)
+            idx = np.searchsorted(t, t_start)
 
-        # Lógica de atualização do Eixo Y (Idêntico a antes)
-        y_data = self.simulador.hist_omega + self.simulador.hist_referencia
-        if y_data:
-             min_y = min(y_data) * 1.1 - 5 
-             max_y = max(y_data) * 1.1 + 5
-             if min_y == max_y or abs(min_y - max_y) < 1: 
-                 min_y -= 10
-                 max_y += 10
-             self.plot_velocidade.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
-             self.plot_velocidade.setYRange(min_y, max_y, padding=0)
+        # 3. Define a função auxiliar (AGORA FORA DO IF PARA EVITAR O ERRO)
+        def get_data(deque_obj):
+            arr = np.array(deque_obj)
+            return arr[idx:]
 
+        # 4. Atualiza curvas usando a função auxiliar
+        # Dados fatiados (Slicing)
+        view_speed = get_data(self.sim.hist_speed)
+        view_ref = get_data(self.sim.hist_ref)
 
-# --- Bloco Principal de Execução ---
+        self.curve_speed.setData(t[idx:], view_speed)
+        self.curve_ref.setData(t[idx:], view_ref)
+        self.curve_Va.setData(t[idx:], get_data(self.sim.hist_Va))
+        self.curve_Vb.setData(t[idx:], get_data(self.sim.hist_Vb))
+        self.curve_Vc.setData(t[idx:], get_data(self.sim.hist_Vc))
+        self.curve_Ia.setData(t[idx:], get_data(self.sim.hist_Ia))
+        self.curve_Ib.setData(t[idx:], get_data(self.sim.hist_Ib))
+        self.curve_Ic.setData(t[idx:], get_data(self.sim.hist_Ic))
+        
+        # 5. Trava Eixo Y (Velocidade) em 0
+        if len(view_speed) > 0:
+            current_max = max(np.max(view_speed), np.max(view_ref))
+            top_limit = max(current_max * 1.1, 10.0)
+            self.plot_speed.setYRange(0, top_limit, padding=0)
+        
+        self.plot_speed.setXRange(t_start, t[-1], padding=0.02)
+# =============================================================================
+# MAIN
+# =============================================================================
 if __name__ == '__main__':
-    DT = 0.0001 # 0.1 ms (Um DT menor é melhor para a estabilidade do FOC)
-    
-    # Configurações do PyQtGraph (Opcional, mas melhora a suavidade)
+    DT = 0.00005 
     pg.setConfigOptions(antialias=True)
-    
-    # Cria a Aplicação Qt
     app = QApplication(sys.argv)
-    
-    # Instancia o simulador e a GUI
-    sim = Simulador(dt=DT)
-    window = AplicacaoGUI(sim)
+    sim = Simulator(dt=DT)
+    window = GuiApplication(sim)
     window.show()
-    
-    # Executa o loop principal do Qt
     sys.exit(app.exec())
